@@ -92,6 +92,7 @@ branch = true
 source = [
     "main",
     "sanitize",
+    "telegram_mcp.chat_scope",
     "telegram_mcp.runtime",
 ]
 
