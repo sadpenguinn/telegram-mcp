@@ -32,7 +32,7 @@ discover-chats: ## List this account's dialogs with their ids, to fill TELEGRAM_
 
 .PHONY: refresh-tool-baseline
 refresh-tool-baseline: ## Accept the current tool list AFTER classifying new tools for scope
-	uv run python -c "import telegram_mcp.tools; from telegram_mcp.runtime import mcp; \
+	uv run --env-file .env.example python -c "import telegram_mcp.tools; from telegram_mcp.runtime import mcp; \
 	  names=sorted(t.name for t in mcp._tool_manager.list_tools()); \
 	  open('tests/scope_reviewed_tools.txt','w').write('\n'.join(names)+'\n'); \
 	  print(len(names),'tools recorded')"
