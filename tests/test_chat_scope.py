@@ -213,21 +213,56 @@ def test_input_entity_is_checked_via_a_second_lookup(gated_runtime):
 # --- gate B: dialog listings ---------------------------------------------
 
 
-def test_dialog_gate_filters_listings(monkeypatch):
-    import asyncio
-
+@pytest.fixture
+def gated_dialogs(monkeypatch):
+    """TelegramClient.get_dialogs stubbed, then wrapped by the dialog gate."""
     from telethon import TelegramClient
 
-    async def fake_get_dialogs(self, *args, **kwargs):
-        return [Dialog(Channel(111)), Dialog(Channel(222)), Dialog(User(333))]
+    seen = {}
+
+    async def fake_get_dialogs(self, limit=None, *args, **kwargs):
+        seen["limit"] = limit
+        # Out-of-scope chats first: Telegram orders by recent activity, not by
+        # what we are allowed to see.
+        return [Dialog(User(333)), Dialog(Channel(222)), Dialog(Channel(111))]
 
     monkeypatch.setattr(TelegramClient, "get_dialogs", fake_get_dialogs)
-    chat_scope._install_dialog_gate(chat_scope.load_scope("-100111"))
+    chat_scope._install_dialog_gate(chat_scope.load_scope("-100111,-100222"))
     try:
-        dialogs = asyncio.run(TelegramClient.get_dialogs(object()))
-        assert [d.entity.id for d in dialogs] == [111]
+        yield TelegramClient, seen
     finally:
         monkeypatch.undo()
+
+
+def test_dialog_gate_filters_listings(gated_dialogs):
+    import asyncio
+
+    client_cls, _ = gated_dialogs
+    dialogs = asyncio.run(client_cls.get_dialogs(object()))
+    assert [d.entity.id for d in dialogs] == [222, 111]
+
+
+@pytest.mark.parametrize("call", ["positional", "keyword"])
+def test_limit_applies_after_filtering_not_before(gated_dialogs, call):
+    """Otherwise get_dialogs(limit=1) answers "no chats" whenever the most
+    recent dialog is one we hide, which is most of the time."""
+    import asyncio
+
+    client_cls, seen = gated_dialogs
+    if call == "positional":
+        dialogs = asyncio.run(client_cls.get_dialogs(object(), 1))
+    else:
+        dialogs = asyncio.run(client_cls.get_dialogs(object(), limit=1))
+
+    assert seen["limit"] is None, "the underlying fetch must not be truncated first"
+    assert [d.entity.id for d in dialogs] == [222]
+
+
+def test_dialog_gate_passes_other_arguments_through(gated_dialogs):
+    import asyncio
+
+    client_cls, _ = gated_dialogs
+    asyncio.run(client_cls.get_dialogs(object(), limit=5, archived=True))
 
 
 # --- gate C: account-wide tools ------------------------------------------
@@ -271,8 +306,8 @@ def test_global_tools_are_refused_in_deny_mode():
 
     manager = server._tool_manager
     assert asyncio.run(manager.call_tool("list_messages", {})) == "ran list_messages"
-    refusal = asyncio.run(manager.call_tool("search_global", {}))
-    assert "Out of scope" in refusal
+    with pytest.raises(chat_scope.ChatNotInScopeError, match="Out of scope"):
+        asyncio.run(manager.call_tool("search_global", {}))
     # Refused, not merely reported as failed: the tool never ran.
     assert manager.called == ["list_messages"]
     assert [t.name for t in manager.list_tools()] == TOOL_NAMES
@@ -292,17 +327,18 @@ def test_allow_mode_keeps_global_tools_callable():
     assert asyncio.run(server._tool_manager.call_tool("search_global", {})) == "ran search_global"
 
 
-def test_tool_gate_catches_scope_errors_from_tools_without_a_catch_all():
-    import asyncio
+def test_refusals_travel_as_the_exception_text():
+    """FastMCP renders a raised exception as str(exc), so the payload must be it.
 
-    server = _FakeServer(["list_messages"])
-
-    async def raising(name, arguments, *args, **kwargs):
-        raise chat_scope.ChatNotInScopeError("nope")
-
-    server._tool_manager.call_tool = raising
-    chat_scope._install_tool_gate(server, "deny")
-    assert asyncio.run(server._tool_manager.call_tool("list_messages", {})) == "nope"
+    Returning the text instead would be validated against the tool's
+    outputSchema and rejected as "no structured output returned", leaving the
+    model with a schema complaint rather than the reason.
+    """
+    assert (
+        str(chat_scope._denied_tool("search_global"))
+        == chat_scope._denied_tool("search_global").payload
+    )
+    assert str(chat_scope._denied_chat("telegram")) == chat_scope._denied_chat("telegram").payload
 
 
 # --- gate E: the refusal survives the generic error formatter -------------
@@ -476,3 +512,47 @@ def test_install_reports_the_active_scope(monkeypatch, capsys, restore_patch_poi
     err = capsys.readouterr().err
     assert "Chat scope active" in err and "111" in err
     assert [t.name for t in server._tool_manager.list_tools()] == ["list_messages"]
+
+
+# --- refusing without a lookup -------------------------------------------
+
+
+@pytest.mark.parametrize("identifier", [-1001338630868, "-1001338630868", 42, "42"])
+def test_numeric_identifiers_are_refused_without_asking_telegram(identifier):
+    scope = chat_scope.load_scope("-100111")
+    assert scope.denies_identifier(identifier)
+
+
+@pytest.mark.parametrize("identifier", [-1000000000111, "-1000000000111", 111, "111"])
+def test_allowed_numeric_identifiers_are_not_pre_refused(identifier):
+    scope = chat_scope.load_scope("-100111")
+    assert not scope.denies_identifier(identifier)
+
+
+@pytest.mark.parametrize("identifier", ["@somechat", "somechat", "мамин чат", "me", True])
+def test_non_numeric_identifiers_need_a_lookup(identifier):
+    """Usernames and saved aliases only reveal their chat once resolved."""
+    scope = chat_scope.load_scope("-100111")
+    assert not scope.denies_identifier(identifier)
+
+
+def test_pre_check_stands_down_while_usernames_are_configured():
+    """An unresolved @username could still turn out to be this id."""
+    scope = chat_scope.load_scope("-100111,@pulse_chat")
+    assert not scope.denies_identifier(-1001338630868)
+
+
+def test_pre_check_is_off_when_scoping_is_disabled():
+    assert not chat_scope.load_scope("").denies_identifier(-1001338630868)
+
+
+def test_entity_gate_refuses_before_resolving(gated_runtime):
+    """The refusal must not depend on the chat being resolvable: a chat this
+    account has never joined would otherwise fail resolution and reach the
+    model as upstream's generic "An error occurred (code: ...)"."""
+    import asyncio
+
+    runtime, calls = gated_runtime
+    with pytest.raises(chat_scope.ChatNotInScopeError):
+        asyncio.run(runtime.resolve_entity(-1001338630868))
+    assert calls == [], "no Telegram lookup should have been attempted"

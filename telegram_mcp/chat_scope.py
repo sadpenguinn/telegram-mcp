@@ -183,6 +183,31 @@ class ChatScope:
         known = self.ids | self.learned_ids
         return bool(_id_keys(int(chat_id)) & known)
 
+    def denies_identifier(self, identifier: Any) -> bool:
+        """True when `identifier` can be refused without asking Telegram.
+
+        Only safe for a bare numeric id, and only while the allowlist names no
+        @usernames: an unresolved username could still turn out to be this id,
+        and refusing it would be wrong. Worth the narrow scope -- it is the
+        common case, it saves a lookup per refused call, and it means a chat
+        this account is not a member of is refused as out of scope instead of
+        failing resolution and surfacing as a generic error.
+        """
+        if not self.enabled or self.usernames:
+            return False
+        if isinstance(identifier, bool):
+            return False
+        if isinstance(identifier, int):
+            return not self.allows_id(identifier)
+        text = str(identifier).strip()
+        if text.startswith("-"):
+            digits = text[1:]
+        else:
+            digits = text
+        if not digits.isdigit():
+            return False
+        return not self.allows_id(int(text))
+
     def allows(self, entity: Any) -> bool:
         """True if `entity` (a Telethon entity, a Dialog, or a raw id) is in scope."""
         if not self.enabled:
@@ -398,6 +423,8 @@ def _install_entity_gate(runtime: Any, scope: ChatScope) -> None:
         return
 
     async def _resolve(getter, identifier, client, label):
+        if scope.denies_identifier(identifier):
+            raise _denied_chat(identifier)
         entity = await original(getter, identifier, client, label)
         # get_input_entity returns an InputPeer, which carries channel_id/chat_id/
         # user_id rather than a plain id; resolve it to a real entity to check.
@@ -423,13 +450,26 @@ def _install_dialog_gate(scope: ChatScope) -> None:
         return
 
     async def get_dialogs(self, *args, **kwargs):
-        dialogs = await original(self, *args, **kwargs)
+        # `limit` counts dialogs Telegram returns, which are ordered by recent
+        # activity and mostly out of scope. Applying it before the filter makes
+        # get_dialogs(limit=5) answer "no chats" whenever the five most recent
+        # dialogs happen to be ones we hide -- so ask for everything and impose
+        # the caller's limit on what survives. The universe is bounded by the
+        # account's dialog list, which startup already fetches in full to warm
+        # the entity cache.
+        requested = kwargs.pop("limit", args[0] if args else None)
+        rest = args[1:] if args else ()
+        dialogs = await original(self, None, *rest, **kwargs)
+
         # Telethon has already cached every entity it just fetched, so dropping
         # them from the returned list keeps resolution of in-scope chats working.
         try:
-            return [d for d in dialogs if scope.allows(getattr(d, "entity", d))]
+            allowed = [d for d in dialogs if scope.allows(getattr(d, "entity", d))]
         except TypeError:
             return dialogs
+        if isinstance(requested, int) and requested >= 0:
+            return allowed[:requested]
+        return allowed
 
     get_dialogs._scope_wrapped = True
     TelegramClient.get_dialogs = get_dialogs
@@ -452,13 +492,14 @@ def _install_tool_gate(server: Any, mode: str) -> list[str]:
 
     async def call_tool(name, arguments, *args, **kwargs):
         if mode == "deny" and name in GLOBAL_TOOLS:
-            return _denied_tool(name).payload
-        try:
-            return await original(name, arguments, *args, **kwargs)
-        except ChatNotInScopeError as exc:
-            # A tool without a catch-all `except Exception` would otherwise
-            # surface this as a transport-level failure.
-            return exc.payload
+            # Raise rather than return the text: FastMCP calls this with
+            # convert_result=True and validates the result against the tool's
+            # outputSchema, so a bare string here fails as "no structured output
+            # returned" and the model never sees why it was refused. An
+            # exception takes the documented error path instead, which carries
+            # str(exc) and skips output validation.
+            raise _denied_tool(name)
+        return await original(name, arguments, *args, **kwargs)
 
     call_tool._scope_wrapped = True
     manager.call_tool = call_tool

@@ -78,6 +78,10 @@ confined to one chat (gates A/B already handle it) or reaches the whole account
 - **Members of an allowed chat are not themselves allowed.** Looking up a
   sender's full profile (`get_full_user`) is refused unless that user is in the
   allowlist. Message listings still carry sender names.
+- **Prefer numeric ids in the allowlist.** With ids only, an out-of-scope chat
+  is refused without contacting Telegram. Add one `@username` and that shortcut
+  switches off for everything — an unresolved username could turn out to be the
+  id being asked for — so each refusal costs a lookup first.
 - **The Telegram session keeps full account authority.** This is a guardrail on
   what the model can ask for, not a reduction of the session's own rights.
   Anything that bypasses the five chokepoints — a raw MTProto call added
