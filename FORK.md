@@ -11,7 +11,7 @@ closely, so the fork is deliberately tiny and additive.
 | `telegram_mcp/chat_scope.py` | new | The entire restriction. |
 | `tests/test_chat_scope.py` | new | Gate tests + the merge canary. |
 | `tests/scope_reviewed_tools.txt` | new | Snapshot of the 128 upstream tools we have classified. |
-| `scripts/discover_chats.py` | new | Lists your dialogs so you can fill the allowlist. |
+| `scripts/discover_chats.py` | new | Reads a Telegram folder's chats to fill the allowlist. |
 | `Makefile`, `FORK.md` | new | Fork workflow. |
 | `telegram_mcp/runner.py` | **2 lines** | One import, one `_chat_scope.install()` in `main()`. |
 | `.env.example` | +1 block | Documents the two new variables. |
@@ -24,11 +24,16 @@ rewrite, so `git merge upstream/main` almost never conflicts.
 
 1. `cp .env.example .env` and fill in `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`
    plus a session (`uv run session_string_generator.py`).
-2. Find the chats you want:
+2. Put the chats you want into a Telegram folder, then read it back:
    ```
-   make discover-chats ARGS="пульс"          # look
-   make discover-chats ARGS="пульс --env"    # ready-to-paste line
+   make folders                              # what folders exist
+   make discover-chats ARGS="Пульс"          # that folder's chats
+   make discover-chats ARGS="Пульс --env"    # ready-to-paste line
    ```
+   A folder beats matching chat titles because keeping the allowlist current
+   later is "add the chat to the folder, re-run this". `--by-title` is still
+   there as a fallback when there is no folder.
+
    The script never loads `chat_scope`, so it can still see chats you have not
    allowed — that is the point.
 3. Put the result in `.env` as `TELEGRAM_ALLOWED_CHATS=...`.
@@ -79,3 +84,6 @@ confined to one chat (gates A/B already handle it) or reaches the whole account
   upstream, for instance — is not covered.
 - `scripts/discover_chats.py` is intentionally unscoped; do not wire it into the
   MCP server.
+- A folder that includes whole *categories* (all contacts, all groups, …) rather
+  than named chats cannot be enumerated from the folder alone; the script says so
+  and lists only the chats explicitly added to it.

@@ -26,8 +26,12 @@ fork-diff: ## Show every change this fork makes on top of upstream
 test: ## Run the test suite (includes the scope gates and the merge canary)
 	uv run pytest -q
 
+.PHONY: folders
+folders: ## List this account's Telegram folders
+	uv run python scripts/discover_chats.py
+
 .PHONY: discover-chats
-discover-chats: ## List this account's dialogs with their ids, to fill TELEGRAM_ALLOWED_CHATS
+discover-chats: ## Chats of a folder, to fill TELEGRAM_ALLOWED_CHATS (ARGS="Пульс --env")
 	uv run python scripts/discover_chats.py $(ARGS)
 
 .PHONY: refresh-tool-baseline
